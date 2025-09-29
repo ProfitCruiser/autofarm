@@ -22,7 +22,13 @@ local AutoFarmUpdate  = ensureRemote("AutoFarmUpdate")
 
 -- === CONFIG (tilpass her) ===
 local CONFIG = {
-    TARGET_FOLDER_NAME = nil,     -- f.eks. "Enemies" eller nil
+    TARGET_FOLDER_NAME = nil,     -- f.eks. "Enemies" eller nil (legacy)
+    TARGET_FOLDERS = {
+        { "Debris", "Monsters" }, -- tilpass til din verden (kan være strenger eller segmenttabeller)
+    },
+    TARGET_MODEL_NAMES = {},      -- eksakt navneliste (case-insensitive)
+    TARGET_NAME_KEYWORDS = { "kriluni" }, -- matcher dersom navnet inneholder (case-insensitive)
+    TARGET_NPC_IDS = { "Kriluni" },       -- matcher NPCId-attributt eller verdi
     ONLY_KRILUNI = true,
     ATTACK_RANGE = 8,
     DPS = 40,
@@ -36,6 +42,65 @@ local CONFIG = {
     REMOTE_NAME = "DealDamage",
     REMOTE_ARGS_STYLE = "TargetOnly",
 }
+
+local function normalizeList(list)
+    local normalized = {}
+    if type(list) ~= "table" then
+        return normalized
+    end
+    for _, value in ipairs(list) do
+        if typeof(value) == "string" and value ~= "" then
+            table.insert(normalized, string.lower(value))
+        end
+    end
+    return normalized
+end
+
+local TARGET_MODEL_NAMES = normalizeList(CONFIG.TARGET_MODEL_NAMES)
+local TARGET_NAME_KEYWORDS = normalizeList(CONFIG.TARGET_NAME_KEYWORDS)
+local TARGET_NPC_IDS = normalizeList(CONFIG.TARGET_NPC_IDS)
+
+local folderFiltersCache = nil
+local folderFiltersCount = 0
+local lastFolderRefresh = 0
+local FOLDER_CACHE_WINDOW = 1.0
+
+local function buildFolderFilters()
+    local filters = {}
+    local count = 0
+
+    local function addFolder(folder)
+        if folder and not filters[folder] then
+            filters[folder] = true
+            count += 1
+        end
+    end
+
+    if CONFIG.TARGET_FOLDER_NAME then
+        addFolder(workspace:FindFirstChild(CONFIG.TARGET_FOLDER_NAME))
+    end
+
+    if type(CONFIG.TARGET_FOLDERS) == "table" then
+        for _, pathSpec in ipairs(CONFIG.TARGET_FOLDERS) do
+            addFolder(resolveWorkspacePath(pathSpec))
+        end
+    end
+
+    return filters, count
+end
+
+local function getFolderFilters()
+    local now = os.clock()
+    if folderFiltersCache and (now - lastFolderRefresh) <= FOLDER_CACHE_WINDOW then
+        return folderFiltersCache, folderFiltersCount
+    end
+
+    local filters, count = buildFolderFilters()
+    folderFiltersCache = filters
+    folderFiltersCount = count
+    lastFolderRefresh = now
+    return filters, count
+end
 
 -- === require adapters (forutsetter modulene i samme mappe: ServerScriptService) ===
 local ss = script.Parent
@@ -74,11 +139,104 @@ local function isAlive(model)
     return hum and hum.Health > 0
 end
 
-local function isKriluni(model)
-    if not model or not model:IsA("Model") then return false end
-    if string.find(string.lower(model.Name), "kriluni") then return true end
-    local ok, attr = pcall(function() return model:GetAttribute("NPCId") end)
-    return ok and attr == "Kriluni"
+local function resolveWorkspacePath(pathSpec)
+    if typeof(pathSpec) == "Instance" then
+        return pathSpec
+    end
+
+    if type(pathSpec) == "string" then
+        local current = workspace
+        for segment in string.gmatch(pathSpec, "[^/]+") do
+            current = current and current:FindFirstChild(segment)
+        end
+        return current
+    end
+
+    if type(pathSpec) == "table" then
+        local current = workspace
+        for _, segment in ipairs(pathSpec) do
+            if typeof(segment) ~= "string" or segment == "" then
+                return nil
+            end
+            current = current and current:FindFirstChild(segment)
+        end
+        return current
+    end
+
+    return nil
+end
+
+local function isTargetModel(model, requireAlive)
+    if not model or not model:IsA("Model") then
+        return false
+    end
+
+    local folderFilters, filterCount = getFolderFilters()
+    if filterCount > 0 then
+        local matchesFolder = false
+        for folder in pairs(folderFilters) do
+            if model:IsDescendantOf(folder) then
+                matchesFolder = true
+                break
+            end
+        end
+        if not matchesFolder then
+            return false
+        end
+    end
+
+    if requireAlive ~= false and not isAlive(model) then
+        return false
+    end
+
+    local hasFilters = CONFIG.ONLY_KRILUNI or (#TARGET_MODEL_NAMES > 0) or (#TARGET_NAME_KEYWORDS > 0) or (#TARGET_NPC_IDS > 0)
+    if not hasFilters then
+        return true
+    end
+
+    local nameLower = string.lower(model.Name)
+    if CONFIG.ONLY_KRILUNI then
+        if string.find(nameLower, "kriluni", 1, true) then
+            return true
+        end
+        local ok, attr = pcall(function()
+            return model:GetAttribute("NPCId")
+        end)
+        if ok and typeof(attr) == "string" and string.lower(attr) == "kriluni" then
+            return true
+        end
+    end
+
+    for _, exact in ipairs(TARGET_MODEL_NAMES) do
+        if nameLower == exact then
+            return true
+        end
+    end
+
+    for _, keyword in ipairs(TARGET_NAME_KEYWORDS) do
+        if string.find(nameLower, keyword, 1, true) then
+            return true
+        end
+    end
+
+    if #TARGET_NPC_IDS > 0 then
+        local okAttr, attrValue = pcall(function()
+            return model:GetAttribute("NPCId")
+        end)
+        if okAttr and typeof(attrValue) == "string" and table.find(TARGET_NPC_IDS, string.lower(attrValue)) then
+            return true
+        end
+
+        local npcIdInstance = model:FindFirstChild("NPCId")
+        if npcIdInstance and npcIdInstance:IsA("StringValue") then
+            local lowerValue = string.lower(npcIdInstance.Value)
+            if table.find(TARGET_NPC_IDS, lowerValue) then
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 local function getLevel(model)
@@ -90,25 +248,44 @@ local function getLevel(model)
     return nil
 end
 
-local function iterNPCs()
-    if CONFIG.TARGET_FOLDER_NAME then
-        local f = workspace:FindFirstChild(CONFIG.TARGET_FOLDER_NAME)
-        if f then return f:GetDescendants() end
-    end
-    return workspace:GetDescendants()
-end
+local function forEachPotentialTarget(callback)
+    local visited = {}
 
-local function findNearestKriluni(fromPos)
-    local best, bestDist
-    for _, inst in ipairs(iterNPCs()) do
-        if inst:IsA("Model") and isAlive(inst) and (not CONFIG.ONLY_KRILUNI or isKriluni(inst)) then
-            local hrp = inst:FindFirstChild("HumanoidRootPart")
-            if hrp and hrp:IsA("BasePart") then
-                local d = (hrp.Position - fromPos).Magnitude
-                if not best or d < bestDist then best, bestDist = inst, d end
+    local function consume(container)
+        if not container or visited[container] then
+            return
+        end
+        visited[container] = true
+        for _, inst in ipairs(container:GetDescendants()) do
+            if inst:IsA("Model") then
+                callback(inst)
             end
         end
     end
+
+    local folderFilters, filterCount = getFolderFilters()
+    if filterCount > 0 then
+        for folder in pairs(folderFilters) do
+            consume(folder)
+        end
+    else
+        consume(workspace)
+    end
+end
+
+local function findNearestTarget(fromPos)
+    local best, bestDist
+    forEachPotentialTarget(function(inst)
+        if isTargetModel(inst) then
+            local hrp = inst:FindFirstChild("HumanoidRootPart")
+            if hrp and hrp:IsA("BasePart") then
+                local d = (hrp.Position - fromPos).Magnitude
+                if not best or d < bestDist then
+                    best, bestDist = inst, d
+                end
+            end
+        end
+    end)
     return best, bestDist
 end
 
@@ -120,7 +297,12 @@ local function pushGoto(player, targetModel)
     end
     local hrp = targetModel:FindFirstChild("HumanoidRootPart")
     if hrp then
-        AutoFarmUpdate:FireClient(player, { cmd = "goto", pos = hrp.Position, targetName = targetModel.Name })
+        AutoFarmUpdate:FireClient(player, {
+            cmd = "goto",
+            pos = hrp.Position,
+            targetName = targetModel.Name,
+            range = CONFIG.ATTACK_RANGE,
+        })
     else
         AutoFarmUpdate:FireClient(player, { cmd = "clear" })
     end
@@ -128,7 +310,10 @@ end
 
 -- === player state ===
 local State = {}
-local function initPlayer(p) State[p] = { enabled = false, target = nil, lastScan = 0 } end
+local function initPlayer(p)
+    State[p] = { enabled = false, target = nil, lastScan = 0 }
+    AutoFarmUpdate:FireClient(p, { cmd = "status", enabled = false, range = CONFIG.ATTACK_RANGE })
+end
 local function removePlayer(p) State[p] = nil end
 Players.PlayerAdded:Connect(initPlayer)
 Players.PlayerRemoving:Connect(removePlayer)
@@ -142,10 +327,10 @@ AutoFarmRequest.OnServerEvent:Connect(function(player, action)
         st.enabled = not st.enabled
         if not st.enabled then
             st.target = nil
-            AutoFarmUpdate:FireClient(player, { cmd = "status", enabled = false })
+            AutoFarmUpdate:FireClient(player, { cmd = "status", enabled = false, range = CONFIG.ATTACK_RANGE })
             AutoFarmUpdate:FireClient(player, { cmd = "clear" })
         else
-            AutoFarmUpdate:FireClient(player, { cmd = "status", enabled = true })
+            AutoFarmUpdate:FireClient(player, { cmd = "status", enabled = true, range = CONFIG.ATTACK_RANGE })
         end
     end
 end)
@@ -177,8 +362,31 @@ local function attachWatcher(model)
     end
 end
 
-for _,d in ipairs(iterNPCs()) do if d:IsA("Model") then attachWatcher(d) end end
-workspace.DescendantAdded:Connect(function(d) if d:IsA("Model") then task.defer(function() attachWatcher(d) end) end end)
+forEachPotentialTarget(function(inst)
+    if isTargetModel(inst, false) then
+        attachWatcher(inst)
+    end
+end)
+
+workspace.DescendantAdded:Connect(function(d)
+    if d:IsA("Folder") then
+        folderFiltersCache = nil
+    end
+    if not d:IsA("Model") then
+        return
+    end
+    task.defer(function()
+        if isTargetModel(d, false) then
+            attachWatcher(d)
+        end
+    end)
+end)
+
+workspace.DescendantRemoving:Connect(function(d)
+    if d:IsA("Folder") then
+        folderFiltersCache = nil
+    end
+end)
 
 -- === main server tick ===
 RunService.Heartbeat:Connect(function(dt)
@@ -192,7 +400,7 @@ RunService.Heartbeat:Connect(function(dt)
         local needScan = (not st.target) or (not isAlive(st.target)) or ((now - (st.lastScan or 0)) >= CONFIG.SCAN_INTERVAL)
         if needScan then
             st.lastScan = now
-            st.target = select(1, findNearestKriluni(hrpP.Position))
+            st.target = select(1, findNearestTarget(hrpP.Position))
             if st.target then pushGoto(player, st.target) else pushGoto(player, nil) end
         end
 

@@ -82,6 +82,7 @@ local FarmState = {
     Enabled = false,
     TargetName = nil,
     TargetPosition = nil,
+    TargetRange = nil,
     PendingSince = nil,
 }
 
@@ -93,6 +94,125 @@ local FarmUI = {
 }
 
 local lastTargetText = nil
+
+local FarmNavigator = {
+    lastIssued = 0,
+    lastTargetPos = nil,
+    lastRootPos = nil,
+    stuckTime = 0,
+    active = false,
+}
+
+local function getLocalHumanoid()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil, nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not hrp then
+        return nil, nil
+    end
+    return humanoid, hrp
+end
+
+local function resetFarmNavigator(stopMovement)
+    if stopMovement then
+        local humanoid = getLocalHumanoid()
+        if humanoid then
+            humanoid:Move(Vector3.zero)
+            humanoid.AutoRotate = true
+        end
+    end
+    FarmNavigator.lastIssued = 0
+    FarmNavigator.lastTargetPos = nil
+    FarmNavigator.lastRootPos = nil
+    FarmNavigator.stuckTime = 0
+    FarmNavigator.active = false
+end
+
+local function updateFarmNavigator(dt)
+    if not FarmState.Enabled then
+        if FarmNavigator.active or FarmNavigator.lastTargetPos then
+            resetFarmNavigator(true)
+        end
+        return
+    end
+
+    local targetPos = FarmState.TargetPosition
+    if not targetPos then
+        if FarmNavigator.active or FarmNavigator.lastTargetPos then
+            resetFarmNavigator(true)
+        end
+        return
+    end
+
+    local humanoid, hrp = getLocalHumanoid()
+    if not humanoid or not hrp then
+        FarmNavigator.lastTargetPos = nil
+        return
+    end
+
+    local attackRange = tonumber(FarmState.TargetRange) or 0
+    local stopDistance = math.max(attackRange * 0.75, 4)
+    local distance = (targetPos - hrp.Position).Magnitude
+    if distance <= stopDistance then
+        if FarmNavigator.active then
+            resetFarmNavigator(true)
+        end
+        return
+    end
+
+    local needMove = false
+    if not FarmNavigator.lastTargetPos then
+        needMove = true
+    elseif (FarmNavigator.lastTargetPos - targetPos).Magnitude >= 2 then
+        needMove = true
+    elseif os.clock() - (FarmNavigator.lastIssued or 0) >= 1.2 then
+        needMove = true
+    end
+
+    if needMove then
+        humanoid.AutoRotate = false
+        humanoid:MoveTo(targetPos)
+        FarmNavigator.lastIssued = os.clock()
+        FarmNavigator.lastTargetPos = targetPos
+        FarmNavigator.active = true
+    end
+
+    if FarmNavigator.lastRootPos then
+        local delta = (hrp.Position - FarmNavigator.lastRootPos).Magnitude
+        if delta < 0.5 then
+            FarmNavigator.stuckTime = (FarmNavigator.stuckTime or 0) + dt
+            if FarmNavigator.stuckTime > 2 then
+                humanoid.Jump = true
+                humanoid:MoveTo(targetPos)
+                FarmNavigator.lastIssued = os.clock()
+                FarmNavigator.stuckTime = 0
+            end
+        else
+            FarmNavigator.stuckTime = 0
+        end
+    else
+        FarmNavigator.stuckTime = 0
+    end
+
+    FarmNavigator.lastRootPos = hrp.Position
+end
+
+if LocalPlayer.Character then
+    resetFarmNavigator(false)
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.defer(function()
+        resetFarmNavigator(true)
+    end)
+end)
+
+LocalPlayer.CharacterRemoving:Connect(function()
+    resetFarmNavigator(false)
+end)
 
 local function refreshFarmStatus()
     if not FarmUI.statusValue then return end
@@ -179,9 +299,14 @@ local function onAutoFarmUpdate(payload)
     if cmd == "status" then
         FarmState.PendingSince = nil
         FarmState.Enabled = payload.enabled == true
+        if typeof(payload.range) == "number" then
+            FarmState.TargetRange = payload.range
+        end
         if not FarmState.Enabled then
             FarmState.TargetName = nil
             FarmState.TargetPosition = nil
+            FarmState.TargetRange = nil
+            resetFarmNavigator(true)
         end
     elseif cmd == "goto" then
         FarmState.TargetName = payload.targetName or "Kriluni"
@@ -190,9 +315,14 @@ local function onAutoFarmUpdate(payload)
         else
             FarmState.TargetPosition = nil
         end
+        if typeof(payload.range) == "number" then
+            FarmState.TargetRange = payload.range
+        end
     elseif cmd == "clear" then
         FarmState.TargetName = nil
         FarmState.TargetPosition = nil
+        FarmState.TargetRange = nil
+        resetFarmNavigator(true)
     end
 
     refreshFarmStatus()
@@ -1291,6 +1421,10 @@ local function espTick(p)
 end
 RunService.RenderStepped:Connect(function() for _,pl in ipairs(Players:GetPlayers()) do espTick(pl) end end)
 Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task.wait(0.2); espTick(p) end) end)
+
+RunService.Heartbeat:Connect(function(dt)
+    updateFarmNavigator(dt)
+end)
 
 --==================== PAGES & CONTROLS ====================--
 local FarmP   = newPage("KriluniFarm")
