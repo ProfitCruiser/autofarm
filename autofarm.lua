@@ -69,21 +69,11 @@ local function setInteractable(frame, on)
     frame.Active = on
 end
 
---==================== KRILUNI FARM CLIENT STATE ====================--
-local AutoFarmRequestRemote = nil
-local AutoFarmUpdateRemote = nil
-local farmRemotesReady = false
-local autoFarmUpdateConn = nil
-local remotesFolderRef = nil
-local remotesAddedConn = nil
-local remotesRemovedConn = nil
-
 local FarmState = {
     Enabled = false,
     TargetName = nil,
     TargetPosition = nil,
     TargetRange = nil,
-    PendingSince = nil,
 }
 
 local FarmUI = {
@@ -103,6 +93,38 @@ local FarmNavigator = {
     active = false,
 }
 
+local FARM_CONFIG = {
+    AttackRange = 10,
+    ScanInterval = 0.4,
+    MaxAcquireDistance = 650,
+    AttackCooldown = 0.25,
+    DamagePerHit = 65,
+    TargetKeywords = {"kriluni"},
+    TargetNPCIds = { Kriluni = true },
+    Combat = {
+        RemotePaths = {
+            {"ReplicatedStorage", "Events", "Damage_Event"},
+            {"ReplicatedStorage", "Events", "Player_Damage"},
+            {"ReplicatedStorage", "Events", "To_Server"},
+            {"ReplicatedStorage", "Events", "API"},
+        },
+        PayloadStyles = {"TargetOnly", "TargetDamage", "VerbTargetDamage", "VerbTable", "Table"},
+    },
+}
+
+local CombatState = {
+    Remote = nil,
+    LastStyle = nil,
+    LastSearch = -math.huge,
+}
+
+local FarmController = {
+    Enabled = false,
+    CurrentTarget = nil,
+    LastScan = 0,
+    LastAttack = 0,
+}
+
 local function getLocalHumanoid()
     local character = LocalPlayer.Character
     if not character then
@@ -115,6 +137,184 @@ local function getLocalHumanoid()
     end
     return humanoid, hrp
 end
+
+local function resolveInstancePath(path)
+    if typeof(path) ~= "table" or #path == 0 then
+        return nil
+    end
+
+    local node = path[1]
+    if typeof(node) == "Instance" then
+        -- use directly
+    elseif typeof(node) == "string" then
+        if node:lower() == "workspace" then
+            node = workspace
+        else
+            local ok, svc = pcall(function()
+                return game:GetService(node)
+            end)
+            node = ok and svc or nil
+        end
+    else
+        node = nil
+    end
+
+    if not node then
+        return nil
+    end
+
+    for i = 2, #path do
+        node = node:FindFirstChild(path[i])
+        if not node then
+            return nil
+        end
+    end
+
+    return node
+end
+
+local function ensureCombatRemote()
+    local remote = CombatState.Remote
+    if remote and remote.Parent then
+        return remote
+    end
+
+    local now = os.clock()
+    if now - CombatState.LastSearch < 1 then
+        return nil
+    end
+
+    CombatState.LastSearch = now
+    CombatState.Remote = nil
+
+    for _, path in ipairs(FARM_CONFIG.Combat.RemotePaths) do
+        local candidate = resolveInstancePath(path)
+        if candidate and candidate:IsA("RemoteEvent") then
+            CombatState.Remote = candidate
+            break
+        end
+    end
+
+    return CombatState.Remote
+end
+
+local function tryCombatPayload(remote, style, target, damage)
+    if not remote then return false end
+
+    local ok = false
+    if style == "TargetOnly" then
+        ok = pcall(function()
+            remote:FireServer(target)
+        end)
+    elseif style == "TargetDamage" then
+        ok = pcall(function()
+            remote:FireServer(target, damage)
+        end)
+    elseif style == "VerbTargetDamage" then
+        ok = pcall(function()
+            remote:FireServer("Damage", target, damage)
+        end)
+    elseif style == "VerbTable" then
+        ok = pcall(function()
+            remote:FireServer("Damage", {target = target, damage = damage})
+        end)
+    elseif style == "Table" then
+        ok = pcall(function()
+            remote:FireServer({target = target, damage = damage})
+        end)
+    end
+
+    return ok
+end
+
+local function deliverCombat(targetModel, damage)
+    local remote = ensureCombatRemote()
+    local humanoid = targetModel and targetModel:FindFirstChildOfClass("Humanoid")
+    if remote then
+        if CombatState.LastStyle then
+            if tryCombatPayload(remote, CombatState.LastStyle, targetModel, damage) then
+                return true
+            else
+                CombatState.LastStyle = nil
+            end
+        end
+
+        for _, style in ipairs(FARM_CONFIG.Combat.PayloadStyles) do
+            if tryCombatPayload(remote, style, targetModel, damage) then
+                CombatState.LastStyle = style
+                return true
+            end
+        end
+    end
+
+    if humanoid and humanoid.Health > 0 then
+        pcall(function()
+            humanoid:TakeDamage(damage)
+        end)
+        return true
+    end
+
+    return false
+end
+
+local function isModelAlive(model)
+    if not model or not model:IsA("Model") then
+        return false
+    end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0 and hum.Parent == model
+end
+
+local function matchesKriluni(model)
+    if not model then return false end
+    local name = model.Name or ""
+    for _, keyword in ipairs(FARM_CONFIG.TargetKeywords) do
+        if string.find(string.lower(name), keyword) then
+            return true
+        end
+    end
+
+    local ok, attr = pcall(function()
+        return model:GetAttribute("NPCId")
+    end)
+    if ok and attr and FARM_CONFIG.TargetNPCIds[attr] then
+        return true
+    end
+
+    local npcIdValue = model:FindFirstChild("NPCId")
+    if npcIdValue and npcIdValue:IsA("StringValue") and FARM_CONFIG.TargetNPCIds[npcIdValue.Value] then
+        return true
+    end
+
+    return false
+end
+
+local function findNearestTarget(origin)
+    local nearestModel = nil
+    local bestDist = math.huge
+
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("Model") then
+            if matchesKriluni(inst) and isModelAlive(inst) then
+                local hrp = inst:FindFirstChild("HumanoidRootPart")
+                if hrp and hrp:IsA("BasePart") then
+                    local dist = (hrp.Position - origin).Magnitude
+                    if dist < bestDist and dist <= FARM_CONFIG.MaxAcquireDistance then
+                        nearestModel = inst
+                        bestDist = dist
+                    end
+                end
+            end
+        end
+    end
+
+    return nearestModel, bestDist
+end
+
+local refreshFarmStatus -- forward declaration
+local renderFarmTargetLabel -- forward declaration
+local setFarmEnabled -- forward declaration
+
 
 local function resetFarmNavigator(stopMovement)
     if stopMovement then
@@ -214,48 +414,110 @@ LocalPlayer.CharacterRemoving:Connect(function()
     resetFarmNavigator(false)
 end)
 
+local function clearFarmTarget()
+    if FarmState.TargetName or FarmState.TargetPosition then
+        FarmState.TargetName = nil
+        FarmState.TargetPosition = nil
+        renderFarmTargetLabel()
+    end
+end
+
+local function assignFarmTarget(model, position)
+    FarmState.TargetName = model and model.Name or nil
+    FarmState.TargetPosition = position
+    renderFarmTargetLabel()
+end
+
+local function farmStep(dt)
+    if not FarmController.Enabled then
+        return
+    end
+
+    local humanoid, hrp = getLocalHumanoid()
+    if not humanoid or humanoid.Health <= 0 or not hrp then
+        FarmController.CurrentTarget = nil
+        clearFarmTarget()
+        return
+    end
+
+    FarmState.TargetRange = FARM_CONFIG.AttackRange
+
+    local now = os.clock()
+    local target = FarmController.CurrentTarget
+    if not target or not isModelAlive(target) then
+        if now - FarmController.LastScan >= FARM_CONFIG.ScanInterval then
+            FarmController.LastScan = now
+            local found = select(1, findNearestTarget(hrp.Position))
+            if found then
+                FarmController.CurrentTarget = found
+                local hrpTarget = found:FindFirstChild("HumanoidRootPart")
+                assignFarmTarget(found, hrpTarget and hrpTarget.Position or nil)
+                refreshFarmStatus()
+            else
+                FarmController.CurrentTarget = nil
+                clearFarmTarget()
+                refreshFarmStatus()
+            end
+        else
+            FarmController.CurrentTarget = nil
+            clearFarmTarget()
+            return
+        end
+    end
+
+    target = FarmController.CurrentTarget
+    if not target then
+        return
+    end
+
+    local hrpTarget = target:FindFirstChild("HumanoidRootPart")
+    if not hrpTarget then
+        FarmController.CurrentTarget = nil
+        clearFarmTarget()
+        return
+    end
+
+    assignFarmTarget(target, hrpTarget.Position)
+
+    local distance = (hrpTarget.Position - hrp.Position).Magnitude
+    if distance <= FARM_CONFIG.AttackRange then
+        if now - FarmController.LastAttack >= FARM_CONFIG.AttackCooldown then
+            if deliverCombat(target, FARM_CONFIG.DamagePerHit) then
+                FarmController.LastAttack = now
+            else
+                FarmController.LastAttack = now
+            end
+        end
+    end
+end
+
 local function refreshFarmStatus()
     if not FarmUI.statusValue then return end
 
     local text
     local color
-    if not farmRemotesReady then
-        text = "Waiting for Kriluni remotes…"
-        color = T.Warn
-        FarmState.PendingSince = nil
-    else
-        local pending = FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5
-        if pending then
-            text = "Waiting for server…"
-            color = T.Warn
-        elseif FarmState.Enabled then
-            if FarmState.TargetName then
-                text = "Engaging " .. FarmState.TargetName
-                color = T.Neon
-            else
-                text = "Running — scanning for targets"
-                color = T.Good
-            end
+    if FarmState.Enabled then
+        if FarmState.TargetName then
+            text = "Engaging " .. FarmState.TargetName
+            color = T.Neon
         else
-            text = "Idle — press Start"
-            color = T.Subtle
+            text = "Running — scanning for targets"
+            color = T.Good
         end
-        if not pending and FarmState.PendingSince then
-            FarmState.PendingSince = nil
-        end
+    else
+        text = "Idle — press Start"
+        color = T.Subtle
     end
 
     FarmUI.statusValue.Text = text
     FarmUI.statusValue.TextColor3 = color
 
     if FarmUI.toggleButton then
-        local shouldStop = FarmState.Enabled and (FarmState.PendingSince == nil)
-        FarmUI.toggleButton.Text = shouldStop and "Stop" or "Start"
+        FarmUI.toggleButton.Text = FarmState.Enabled and "Stop" or "Start"
     end
 
     if FarmUI.toggleRow then
-        local interactable = farmRemotesReady and not (FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5)
-        setInteractable(FarmUI.toggleRow, interactable)
+        setInteractable(FarmUI.toggleRow, true)
     end
 end
 
@@ -265,13 +527,7 @@ local function renderFarmTargetLabel()
     local text = "(none)"
     local color = T.Subtle
 
-    if not farmRemotesReady then
-        text = "Remotes offline"
-        color = T.Warn
-    elseif FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5 then
-        text = "Waiting for server…"
-        color = T.Warn
-    elseif FarmState.TargetName then
+    if FarmState.TargetName then
         text = FarmState.TargetName
         color = T.Neon
         if FarmState.TargetPosition then
@@ -292,36 +548,19 @@ local function renderFarmTargetLabel()
     FarmUI.targetValue.TextColor3 = color
 end
 
-local function onAutoFarmUpdate(payload)
-    if typeof(payload) ~= "table" then return end
+local function setFarmEnabled(enabled)
+    enabled = enabled and true or false
+    if FarmController.Enabled == enabled then
+        return
+    end
 
-    local cmd = payload.cmd
-    if cmd == "status" then
-        FarmState.PendingSince = nil
-        FarmState.Enabled = payload.enabled == true
-        if typeof(payload.range) == "number" then
-            FarmState.TargetRange = payload.range
-        end
-        if not FarmState.Enabled then
-            FarmState.TargetName = nil
-            FarmState.TargetPosition = nil
-            FarmState.TargetRange = nil
-            resetFarmNavigator(true)
-        end
-    elseif cmd == "goto" then
-        FarmState.TargetName = payload.targetName or "Kriluni"
-        if typeof(payload.pos) == "Vector3" then
-            FarmState.TargetPosition = payload.pos
-        else
-            FarmState.TargetPosition = nil
-        end
-        if typeof(payload.range) == "number" then
-            FarmState.TargetRange = payload.range
-        end
-    elseif cmd == "clear" then
-        FarmState.TargetName = nil
-        FarmState.TargetPosition = nil
-        FarmState.TargetRange = nil
+    FarmController.Enabled = enabled
+    FarmState.Enabled = enabled
+    FarmState.TargetRange = enabled and FARM_CONFIG.AttackRange or nil
+
+    if not enabled then
+        FarmController.CurrentTarget = nil
+        clearFarmTarget()
         resetFarmNavigator(true)
     end
 
@@ -329,97 +568,6 @@ local function onAutoFarmUpdate(payload)
     renderFarmTargetLabel()
 end
 
-local function attachAutoFarmUpdate(remote)
-    if autoFarmUpdateConn then
-        autoFarmUpdateConn:Disconnect()
-        autoFarmUpdateConn = nil
-    end
-
-    if remote and remote:IsA("RemoteEvent") then
-        AutoFarmUpdateRemote = remote
-        autoFarmUpdateConn = remote.OnClientEvent:Connect(onAutoFarmUpdate)
-    else
-        AutoFarmUpdateRemote = nil
-    end
-end
-
-local resolveAutoFarmRemotes
-
-local function watchRemotesFolder(folder)
-    if remotesAddedConn then remotesAddedConn:Disconnect() remotesAddedConn = nil end
-    if remotesRemovedConn then remotesRemovedConn:Disconnect() remotesRemovedConn = nil end
-
-    remotesFolderRef = folder
-
-    if folder and folder:IsA("Folder") then
-        remotesAddedConn = folder.ChildAdded:Connect(function(child)
-            if child.Name == "AutoFarmRequest" or child.Name == "AutoFarmUpdate" then
-                task.defer(resolveAutoFarmRemotes)
-            end
-        end)
-        remotesRemovedConn = folder.ChildRemoved:Connect(function(child)
-            if child == AutoFarmRequestRemote or child == AutoFarmUpdateRemote then
-                task.defer(resolveAutoFarmRemotes)
-            end
-        end)
-    end
-end
-
-resolveAutoFarmRemotes = function()
-    local folder = ReplicatedStorage:FindFirstChild("Remotes")
-    if folder ~= remotesFolderRef then
-        watchRemotesFolder(folder)
-    end
-
-    if folder and folder:IsA("Folder") then
-        local req = folder:FindFirstChild("AutoFarmRequest")
-        if req and req:IsA("RemoteEvent") then
-            AutoFarmRequestRemote = req
-        else
-            AutoFarmRequestRemote = nil
-        end
-
-        local upd = folder:FindFirstChild("AutoFarmUpdate")
-        if upd and upd:IsA("RemoteEvent") then
-            if AutoFarmUpdateRemote ~= upd then
-                attachAutoFarmUpdate(upd)
-            end
-        else
-            attachAutoFarmUpdate(nil)
-        end
-    else
-        AutoFarmRequestRemote = nil
-        attachAutoFarmUpdate(nil)
-    end
-
-    local ready = AutoFarmRequestRemote ~= nil and AutoFarmUpdateRemote ~= nil
-    if not ready then
-        FarmState.Enabled = false
-        FarmState.TargetName = nil
-        FarmState.TargetPosition = nil
-    end
-    if farmRemotesReady ~= ready then
-        farmRemotesReady = ready
-    end
-
-    refreshFarmStatus()
-    renderFarmTargetLabel()
-end
-
-ReplicatedStorage.ChildAdded:Connect(function(child)
-    if child.Name == "Remotes" then
-        task.defer(resolveAutoFarmRemotes)
-    end
-end)
-
-ReplicatedStorage.ChildRemoved:Connect(function(child)
-    if child == remotesFolderRef then
-        watchRemotesFolder(nil)
-        task.defer(resolveAutoFarmRemotes)
-    end
-end)
-
-task.defer(resolveAutoFarmRemotes)
 
 --==================== ACCESS OVERLAY ====================--
 local Blur = Instance.new("BlurEffect"); Blur.Enabled=false; Blur.Size=0; Blur.Parent=Lighting
@@ -1423,6 +1571,7 @@ RunService.RenderStepped:Connect(function() for _,pl in ipairs(Players:GetPlayer
 Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task.wait(0.2); espTick(p) end) end)
 
 RunService.Heartbeat:Connect(function(dt)
+    farmStep(dt)
     updateFarmNavigator(dt)
 end)
 
@@ -1435,38 +1584,25 @@ local MiscP   = newPage("Misc")
 local ConfP   = newPage("Config")
 
 local function requestAutoFarmToggle()
-    if not AutoFarmRequestRemote or not farmRemotesReady then
-        resolveAutoFarmRemotes()
-        refreshFarmStatus()
-        return
-    end
-
-    if FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5 then
-        return
-    end
-
-    FarmState.PendingSince = os.clock()
-    AutoFarmRequestRemote:FireServer("toggle")
-    refreshFarmStatus()
-    renderFarmTargetLabel()
+    setFarmEnabled(not FarmState.Enabled)
 end
 
-local farmStatusRow,_ = rowBase(FarmP, "Farm Status", "Server-side Kriluni automation status.")
+local farmStatusRow,_ = rowBase(FarmP, "Farm Status", "Executor-side Kriluni automation status.")
 local farmStatusValue = Instance.new("TextLabel", farmStatusRow)
 farmStatusValue.AnchorPoint = Vector2.new(1, 0.5)
 farmStatusValue.BackgroundTransparency = 1
 farmStatusValue.Position = UDim2.new(1, -16, 0.5, 0)
 farmStatusValue.Size = UDim2.new(0, 190, 0, 30)
 farmStatusValue.Font = Enum.Font.GothamMedium
-farmStatusValue.Text = "Waiting for Kriluni remotes…"
-farmStatusValue.TextColor3 = T.Warn
+farmStatusValue.Text = "Idle — press Start"
+farmStatusValue.TextColor3 = T.Subtle
 farmStatusValue.TextSize = 14
 farmStatusValue.TextXAlignment = Enum.TextXAlignment.Right
 farmStatusValue.TextYAlignment = Enum.TextYAlignment.Center
 farmStatusValue.TextTruncate = Enum.TextTruncate.AtEnd
 FarmUI.statusValue = farmStatusValue
 
-local farmTargetRow,_ = rowBase(FarmP, "Current Target", "Nearest Kriluni the server is moving toward or attacking.")
+local farmTargetRow,_ = rowBase(FarmP, "Current Target", "Nearest Kriluni model the executor-side loop is pursuing.")
 local farmTargetValue = Instance.new("TextLabel", farmTargetRow)
 farmTargetValue.AnchorPoint = Vector2.new(1, 0.5)
 farmTargetValue.BackgroundTransparency = 1
@@ -1488,13 +1624,12 @@ end, {
     backgroundColor = T.Accent,
     hoverColor = T.Neon,
     textColor = T.Text,
-}, "Start or stop the server-authoritative Kriluni farm loop. All targeting and rewards stay server-side.")
+}, "Start or stop the executor-side Kriluni farm loop. Targeting, movement, and combat calls are handled locally.")
 FarmUI.toggleRow = farmToggle.Row
 FarmUI.toggleButton = farmToggle.Button
 
 refreshFarmStatus()
 renderFarmTargetLabel()
-resolveAutoFarmRemotes()
 
 local ESPColorPresets = {
     {label = "Crimson Pulse", value = Color3.fromRGB(255, 70, 70)},
@@ -1761,10 +1896,6 @@ local function load(name) if MODE=="filesystem" then local p=PROF.."/"..name..".
 local saveBtn = mkToggle(ConfP,"Save Default (click)", false, function(v,row) if v then local ok,err=save("Default"); (row:FindFirstChildWhichIsA("TextLabel")).Text = ok and "Saved Default ✅" or ("Save failed: "..tostring(err)); task.delay(0.4,function() (row:FindFirstChildWhichIsA("TextLabel")).Text="Save Default (click)" end) end end, "Saves your current settings into the Default profile slot.")
 local loadBtn = mkToggle(ConfP,"Load Default (click)", false, function(v,row) if v then local ok,err=load("Default"); (row:FindFirstChildWhichIsA("TextLabel")).Text = ok and "Loaded Default ✅" or ("Load failed: "..tostring(err)); task.delay(0.4,function() (row:FindFirstChildWhichIsA("TextLabel")).Text="Load Default (click)" end) end end, "Loads the Default profile back into all features.")
 RunService.RenderStepped:Connect(function()
-    if FarmState.PendingSince and (os.clock() - FarmState.PendingSince) >= 5 then
-        FarmState.PendingSince = nil
-        refreshFarmStatus()
-    end
     renderFarmTargetLabel()
 end)
 

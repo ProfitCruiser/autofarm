@@ -1,18 +1,37 @@
 # autofarm
 
-Server-side Kriluni auto-farming scripts for Roblox experiences.
+Executor-side Kriluni auto-farm script for Roblox experiences that exposes a full Aurora panel UI. The farm logic runs entirely on the client/executor without requiring any custom server remotes.
 
 ## Contents
 
-- `ServerScriptService/KriluniAutoFarm.lua`: Main server Script handling scanning, targeting, pathing updates, DPS ticks, and reward payouts. Includes configurable target folders/name filters and shares attack range with clients for navigation.
-- `ServerScriptService/CombatAdapter.lua`: Adapter allowing damage delivery via direct Humanoid damage or a remote combat API.
-- `ServerScriptService/CurrencyAdapter.lua`: Utility module to safely award currency in common player data layouts.
-- `autofarm.lua`: Client-side UI and feature implementation (existing).
+- `autofarm.lua`: Main executor script. Builds the UI, handles key gating, and bundles the Kriluni farming logic alongside aimbot/ESP utilities.
 
-## Setup
+## Getting Started
 
-1. Place the contents of `ServerScriptService` into your Roblox game's **ServerScriptService**.
-2. Ensure the `autofarm.lua` client script is injected/executed from the client (e.g. via a LocalScript or executor).
-3. Customize the `CONFIG` table inside `KriluniAutoFarm.lua` to match your game's folder names, reward key, damage mode, and DPS settings. You can list target folders via `TARGET_FOLDERS`, exact name matches via `TARGET_MODEL_NAMES`, or keywords/NPCId filters to lock onto specific mobs.
-4. The server will automatically spawn `AutoFarmRequest` and `AutoFarmUpdate` RemoteEvents under `ReplicatedStorage/Remotes` for client communication.
-5. On the client, open the **Kriluni Farm** tab in `autofarm.lua` and use the Start/Stop control to toggle the server-driven farm loop. The client now follows the server-provided navigation points automatically until within attack range.
+1. Join the experience and execute `autofarm.lua` through your executor after the world loads.
+2. Complete the Aurora key prompt to unlock the panel.
+3. Open the **Kriluni Farm** tab and press **Start** to toggle the farm loop on/off.
+
+## Kriluni farm behaviour
+
+- Continuously scans the workspace for models whose name includes `Kriluni` or expose `NPCId="Kriluni"`.
+- Uses `Humanoid:MoveTo` commands to walk toward the nearest alive target while showing live distance updates in the UI.
+- When inside the configured attack range, fires one of the existing combat remotes (Damage_Event/Player_Damage/To_Server/API). The script automatically tests several payload styles and caches the first working one. If no remote succeeds it falls back to `Humanoid:TakeDamage` for compatibility with custom setups.
+- Keeps attacking until the target dies, then immediately searches for the next Kriluni.
+
+## Configuration
+
+Tune the `FARM_CONFIG` table near the top of `autofarm.lua`:
+
+- `AttackRange`, `ScanInterval`, `AttackCooldown`, `DamagePerHit`: control spacing, polling, and DPS pacing.
+- `TargetKeywords` / `TargetNPCIds`: adjust which mobs qualify as Kriluni targets.
+- `Combat.RemotePaths`: ordered list of remote locations to try (each entry is a table path such as `{"ReplicatedStorage","Events","Damage_Event"}`).
+- `Combat.PayloadStyles`: payload formats to attempt for each remote (`TargetOnly`, `TargetDamage`, `VerbTargetDamage`, `VerbTable`, `Table`).
+
+Update the list to match the live experience if additional remotes or folders must be used.
+
+## Notes
+
+- The farm runs completely client-side. Rewards are granted by the experience's existing combat handlers once the remote accepts the attack.
+- Movement and combat occur through normal Roblox APIs, so keep the executor running while farming.
+- The script retains the rest of the Aurora utilities (aimbot, ESP, visuals) from earlier revisions.
