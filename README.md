@@ -15,3 +15,4 @@ Server-side Kriluni auto-farming scripts for Roblox experiences.
 2. Ensure the `autofarm.lua` client script is injected/executed from the client (e.g. via a LocalScript or executor).
 3. Customize the `CONFIG` table inside `KriluniAutoFarm.lua` to match your game's folder names, reward key, damage mode, and DPS settings.
 4. The server will automatically spawn `AutoFarmRequest` and `AutoFarmUpdate` RemoteEvents under `ReplicatedStorage/Remotes` for client communication.
+5. On the client, open the **Kriluni Farm** tab in `autofarm.lua` and use the Start/Stop control to toggle the server-driven farm loop.

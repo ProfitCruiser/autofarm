@@ -13,6 +13,7 @@ local Players           = game:GetService("Players")
 local GuiService        = game:GetService("GuiService")
 local HttpService       = game:GetService("HttpService")
 local TextService       = game:GetService("TextService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
@@ -67,6 +68,228 @@ local function setInteractable(frame, on)
     end
     frame.Active = on
 end
+
+--==================== KRILUNI FARM CLIENT STATE ====================--
+local AutoFarmRequestRemote = nil
+local AutoFarmUpdateRemote = nil
+local farmRemotesReady = false
+local autoFarmUpdateConn = nil
+local remotesFolderRef = nil
+local remotesAddedConn = nil
+local remotesRemovedConn = nil
+
+local FarmState = {
+    Enabled = false,
+    TargetName = nil,
+    TargetPosition = nil,
+    PendingSince = nil,
+}
+
+local FarmUI = {
+    statusValue = nil,
+    targetValue = nil,
+    toggleRow = nil,
+    toggleButton = nil,
+}
+
+local lastTargetText = nil
+
+local function refreshFarmStatus()
+    if not FarmUI.statusValue then return end
+
+    local text
+    local color
+    if not farmRemotesReady then
+        text = "Waiting for Kriluni remotes…"
+        color = T.Warn
+        FarmState.PendingSince = nil
+    else
+        local pending = FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5
+        if pending then
+            text = "Waiting for server…"
+            color = T.Warn
+        elseif FarmState.Enabled then
+            if FarmState.TargetName then
+                text = "Engaging " .. FarmState.TargetName
+                color = T.Neon
+            else
+                text = "Running — scanning for targets"
+                color = T.Good
+            end
+        else
+            text = "Idle — press Start"
+            color = T.Subtle
+        end
+        if not pending and FarmState.PendingSince then
+            FarmState.PendingSince = nil
+        end
+    end
+
+    FarmUI.statusValue.Text = text
+    FarmUI.statusValue.TextColor3 = color
+
+    if FarmUI.toggleButton then
+        local shouldStop = FarmState.Enabled and (FarmState.PendingSince == nil)
+        FarmUI.toggleButton.Text = shouldStop and "Stop" or "Start"
+    end
+
+    if FarmUI.toggleRow then
+        local interactable = farmRemotesReady and not (FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5)
+        setInteractable(FarmUI.toggleRow, interactable)
+    end
+end
+
+local function renderFarmTargetLabel()
+    if not FarmUI.targetValue then return end
+
+    local text = "(none)"
+    local color = T.Subtle
+
+    if not farmRemotesReady then
+        text = "Remotes offline"
+        color = T.Warn
+    elseif FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5 then
+        text = "Waiting for server…"
+        color = T.Warn
+    elseif FarmState.TargetName then
+        text = FarmState.TargetName
+        color = T.Neon
+        if FarmState.TargetPosition then
+            local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local dist = (FarmState.TargetPosition - hrp.Position).Magnitude
+                text = string.format("%s (%.0f studs)", FarmState.TargetName, dist)
+            end
+        end
+    elseif FarmState.Enabled then
+        text = "Scanning for Kriluni…"
+    end
+
+    if lastTargetText ~= text then
+        FarmUI.targetValue.Text = text
+        lastTargetText = text
+    end
+    FarmUI.targetValue.TextColor3 = color
+end
+
+local function onAutoFarmUpdate(payload)
+    if typeof(payload) ~= "table" then return end
+
+    local cmd = payload.cmd
+    if cmd == "status" then
+        FarmState.PendingSince = nil
+        FarmState.Enabled = payload.enabled == true
+        if not FarmState.Enabled then
+            FarmState.TargetName = nil
+            FarmState.TargetPosition = nil
+        end
+    elseif cmd == "goto" then
+        FarmState.TargetName = payload.targetName or "Kriluni"
+        if typeof(payload.pos) == "Vector3" then
+            FarmState.TargetPosition = payload.pos
+        else
+            FarmState.TargetPosition = nil
+        end
+    elseif cmd == "clear" then
+        FarmState.TargetName = nil
+        FarmState.TargetPosition = nil
+    end
+
+    refreshFarmStatus()
+    renderFarmTargetLabel()
+end
+
+local function attachAutoFarmUpdate(remote)
+    if autoFarmUpdateConn then
+        autoFarmUpdateConn:Disconnect()
+        autoFarmUpdateConn = nil
+    end
+
+    if remote and remote:IsA("RemoteEvent") then
+        AutoFarmUpdateRemote = remote
+        autoFarmUpdateConn = remote.OnClientEvent:Connect(onAutoFarmUpdate)
+    else
+        AutoFarmUpdateRemote = nil
+    end
+end
+
+local resolveAutoFarmRemotes
+
+local function watchRemotesFolder(folder)
+    if remotesAddedConn then remotesAddedConn:Disconnect() remotesAddedConn = nil end
+    if remotesRemovedConn then remotesRemovedConn:Disconnect() remotesRemovedConn = nil end
+
+    remotesFolderRef = folder
+
+    if folder and folder:IsA("Folder") then
+        remotesAddedConn = folder.ChildAdded:Connect(function(child)
+            if child.Name == "AutoFarmRequest" or child.Name == "AutoFarmUpdate" then
+                task.defer(resolveAutoFarmRemotes)
+            end
+        end)
+        remotesRemovedConn = folder.ChildRemoved:Connect(function(child)
+            if child == AutoFarmRequestRemote or child == AutoFarmUpdateRemote then
+                task.defer(resolveAutoFarmRemotes)
+            end
+        end)
+    end
+end
+
+resolveAutoFarmRemotes = function()
+    local folder = ReplicatedStorage:FindFirstChild("Remotes")
+    if folder ~= remotesFolderRef then
+        watchRemotesFolder(folder)
+    end
+
+    if folder and folder:IsA("Folder") then
+        local req = folder:FindFirstChild("AutoFarmRequest")
+        if req and req:IsA("RemoteEvent") then
+            AutoFarmRequestRemote = req
+        else
+            AutoFarmRequestRemote = nil
+        end
+
+        local upd = folder:FindFirstChild("AutoFarmUpdate")
+        if upd and upd:IsA("RemoteEvent") then
+            if AutoFarmUpdateRemote ~= upd then
+                attachAutoFarmUpdate(upd)
+            end
+        else
+            attachAutoFarmUpdate(nil)
+        end
+    else
+        AutoFarmRequestRemote = nil
+        attachAutoFarmUpdate(nil)
+    end
+
+    local ready = AutoFarmRequestRemote ~= nil and AutoFarmUpdateRemote ~= nil
+    if not ready then
+        FarmState.Enabled = false
+        FarmState.TargetName = nil
+        FarmState.TargetPosition = nil
+    end
+    if farmRemotesReady ~= ready then
+        farmRemotesReady = ready
+    end
+
+    refreshFarmStatus()
+    renderFarmTargetLabel()
+end
+
+ReplicatedStorage.ChildAdded:Connect(function(child)
+    if child.Name == "Remotes" then
+        task.defer(resolveAutoFarmRemotes)
+    end
+end)
+
+ReplicatedStorage.ChildRemoved:Connect(function(child)
+    if child == remotesFolderRef then
+        watchRemotesFolder(nil)
+        task.defer(resolveAutoFarmRemotes)
+    end
+end)
+
+task.defer(resolveAutoFarmRemotes)
 
 --==================== ACCESS OVERLAY ====================--
 local Blur = Instance.new("BlurEffect"); Blur.Enabled=false; Blur.Size=0; Blur.Parent=Lighting
@@ -1070,11 +1293,74 @@ RunService.RenderStepped:Connect(function() for _,pl in ipairs(Players:GetPlayer
 Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task.wait(0.2); espTick(p) end) end)
 
 --==================== PAGES & CONTROLS ====================--
+local FarmP   = newPage("KriluniFarm")
 local AimbotP = newPage("Aimbot")
 local ESPP    = newPage("ESP")
 local VisualP = newPage("Visuals")
 local MiscP   = newPage("Misc")
 local ConfP   = newPage("Config")
+
+local function requestAutoFarmToggle()
+    if not AutoFarmRequestRemote or not farmRemotesReady then
+        resolveAutoFarmRemotes()
+        refreshFarmStatus()
+        return
+    end
+
+    if FarmState.PendingSince and (os.clock() - FarmState.PendingSince) < 5 then
+        return
+    end
+
+    FarmState.PendingSince = os.clock()
+    AutoFarmRequestRemote:FireServer("toggle")
+    refreshFarmStatus()
+    renderFarmTargetLabel()
+end
+
+local farmStatusRow,_ = rowBase(FarmP, "Farm Status", "Server-side Kriluni automation status.")
+local farmStatusValue = Instance.new("TextLabel", farmStatusRow)
+farmStatusValue.AnchorPoint = Vector2.new(1, 0.5)
+farmStatusValue.BackgroundTransparency = 1
+farmStatusValue.Position = UDim2.new(1, -16, 0.5, 0)
+farmStatusValue.Size = UDim2.new(0, 190, 0, 30)
+farmStatusValue.Font = Enum.Font.GothamMedium
+farmStatusValue.Text = "Waiting for Kriluni remotes…"
+farmStatusValue.TextColor3 = T.Warn
+farmStatusValue.TextSize = 14
+farmStatusValue.TextXAlignment = Enum.TextXAlignment.Right
+farmStatusValue.TextYAlignment = Enum.TextYAlignment.Center
+farmStatusValue.TextTruncate = Enum.TextTruncate.AtEnd
+FarmUI.statusValue = farmStatusValue
+
+local farmTargetRow,_ = rowBase(FarmP, "Current Target", "Nearest Kriluni the server is moving toward or attacking.")
+local farmTargetValue = Instance.new("TextLabel", farmTargetRow)
+farmTargetValue.AnchorPoint = Vector2.new(1, 0.5)
+farmTargetValue.BackgroundTransparency = 1
+farmTargetValue.Position = UDim2.new(1, -16, 0.5, 0)
+farmTargetValue.Size = UDim2.new(0, 190, 0, 30)
+farmTargetValue.Font = Enum.Font.Gotham
+farmTargetValue.Text = "(none)"
+farmTargetValue.TextColor3 = T.Subtle
+farmTargetValue.TextSize = 14
+farmTargetValue.TextXAlignment = Enum.TextXAlignment.Right
+farmTargetValue.TextYAlignment = Enum.TextYAlignment.Center
+farmTargetValue.TextTruncate = Enum.TextTruncate.AtEnd
+FarmUI.targetValue = farmTargetValue
+
+local farmToggle = mkButton(FarmP, "Toggle Kriluni Farm", function()
+    requestAutoFarmToggle()
+end, {
+    buttonText = "Start",
+    backgroundColor = T.Accent,
+    hoverColor = T.Neon,
+    textColor = T.Text,
+}, "Start or stop the server-authoritative Kriluni farm loop. All targeting and rewards stay server-side.")
+FarmUI.toggleRow = farmToggle.Row
+FarmUI.toggleButton = farmToggle.Button
+
+refreshFarmStatus()
+renderFarmTargetLabel()
+resolveAutoFarmRemotes()
 
 local ESPColorPresets = {
     {label = "Crimson Pulse", value = Color3.fromRGB(255, 70, 70)},
@@ -1088,6 +1374,7 @@ local ESPColorPresets = {
 }
 
 -- create tabs (avoid firing signals programmatically)
+tabButton("Kriluni Farm", FarmP)
 tabButton("Aimbot", AimbotP)
 tabButton("ESP", ESPP)
 tabButton("Visuals", VisualP)
@@ -1339,6 +1626,13 @@ local function load(name) if MODE=="filesystem" then local p=PROF.."/"..name..".
 
 local saveBtn = mkToggle(ConfP,"Save Default (click)", false, function(v,row) if v then local ok,err=save("Default"); (row:FindFirstChildWhichIsA("TextLabel")).Text = ok and "Saved Default ✅" or ("Save failed: "..tostring(err)); task.delay(0.4,function() (row:FindFirstChildWhichIsA("TextLabel")).Text="Save Default (click)" end) end end, "Saves your current settings into the Default profile slot.")
 local loadBtn = mkToggle(ConfP,"Load Default (click)", false, function(v,row) if v then local ok,err=load("Default"); (row:FindFirstChildWhichIsA("TextLabel")).Text = ok and "Loaded Default ✅" or ("Load failed: "..tostring(err)); task.delay(0.4,function() (row:FindFirstChildWhichIsA("TextLabel")).Text="Load Default (click)" end) end end, "Loads the Default profile back into all features.")
+RunService.RenderStepped:Connect(function()
+    if FarmState.PendingSince and (os.clock() - FarmState.PendingSince) >= 5 then
+        FarmState.PendingSince = nil
+        refreshFarmStatus()
+    end
+    renderFarmTargetLabel()
+end)
 
 -- Show panel when gate closes (only if allowed by flow)
 Gate:GetPropertyChangedSignal("Enabled"):Connect(function()
