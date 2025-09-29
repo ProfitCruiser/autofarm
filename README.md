@@ -1,37 +1,38 @@
 # autofarm
 
-Executor-side Kriluni auto-farm script for Roblox experiences that exposes a full Aurora panel UI. The farm logic runs entirely on the client/executor without requiring any custom server remotes.
+Executor-side Kriluni auto-farm script for Roblox experiences that still use the Aurora key prompt but removes every extra panel
+(Aimbot, ESP, etc.). The only UI after the key gate is the dedicated Kriluni farm controller.
 
 ## Contents
 
-- `autofarm.lua`: Main executor script. Builds the UI, handles key gating, and bundles the Kriluni farming logic alongside aimbot/ESP utilities.
+- `autofarm.lua`: Main executor script. Presents the key gate, then spawns a compact Kriluni farm panel with Start/Stop control and
+  live status feedback.
 
 ## Getting Started
 
-1. Join the experience and execute `autofarm.lua` through your executor after the world loads.
-2. Complete the Aurora key prompt to unlock the panel.
-3. Open the **Kriluni Farm** tab and press **Start** to toggle the farm loop on/off.
+1. Join the experience and execute `autofarm.lua` through your executor once the world finishes loading.
+2. Complete the Aurora key prompt to unlock the panel. The **Get Key** button copies the URL used for key retrieval.
+3. Press **Start** on the Kriluni Farm panel to begin automatic target acquisition, navigation, and damage.
 
 ## Kriluni farm behaviour
 
-- Continuously scans the workspace for models whose name includes `Kriluni` or expose `NPCId="Kriluni"`.
-- Uses `Humanoid:MoveTo` commands to walk toward the nearest alive target while showing live distance updates in the UI.
-- When inside the configured attack range, fires one of the existing combat remotes (Damage_Event/Player_Damage/To_Server/API). The script automatically tests several payload styles and caches the first working one. If no remote succeeds it falls back to `Humanoid:TakeDamage` for compatibility with custom setups.
-- Keeps attacking until the target dies, then immediately searches for the next Kriluni.
+- Continuously scans the workspace for alive models whose name contains `Kriluni` or expose `NPCId = "Kriluni"`.
+- Commands the local Humanoid to walk to the closest target, with basic stuck detection and UI distance updates.
+- Once within the configured attack range, tries the listed combat remotes (Damage_Event/Player_Damage/To_Server/API) using several
+  payload styles, falling back to `Humanoid:TakeDamage` if every remote rejects the call.
+- Repeats the process immediately after a kill so the farm never idles while Kriluni enemies exist.
 
 ## Configuration
 
-Tune the `FARM_CONFIG` table near the top of `autofarm.lua`:
+Adjust the `FARM_CONFIG` table near the top of `autofarm.lua`:
 
-- `AttackRange`, `ScanInterval`, `AttackCooldown`, `DamagePerHit`: control spacing, polling, and DPS pacing.
-- `TargetKeywords` / `TargetNPCIds`: adjust which mobs qualify as Kriluni targets.
-- `Combat.RemotePaths`: ordered list of remote locations to try (each entry is a table path such as `{"ReplicatedStorage","Events","Damage_Event"}`).
+- `AttackRange`, `ScanInterval`, `AttackCooldown`, `DamagePerHit`, `MaxAcquireDistance`: tune spacing, polling cadence, and DPS.
+- `TargetKeywords` / `TargetNPCIds`: control which mobs qualify as Kriluni.
+- `Combat.RemotePaths`: ordered list of RemoteEvents to try (each entry is a table path such as `{"ReplicatedStorage","Events","Damage_Event"}`).
 - `Combat.PayloadStyles`: payload formats to attempt for each remote (`TargetOnly`, `TargetDamage`, `VerbTargetDamage`, `VerbTable`, `Table`).
-
-Update the list to match the live experience if additional remotes or folders must be used.
 
 ## Notes
 
-- The farm runs completely client-side. Rewards are granted by the experience's existing combat handlers once the remote accepts the attack.
-- Movement and combat occur through normal Roblox APIs, so keep the executor running while farming.
-- The script retains the rest of the Aurora utilities (aimbot, ESP, visuals) from earlier revisions.
+- All logic runs client-side; rewards come from the experience once combat remotes succeed.
+- Keep the executor open so movement and damage commands continue to fire.
+- The UI no longer exposes any ESP, aimbot, or extra Aurora utilities—only the key system and farm toggle remain.
